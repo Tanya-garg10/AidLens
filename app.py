@@ -1,9 +1,12 @@
-# app.py
-import streamlit as st
+# app.py — AidLens (Text + Image + PDF + Voice: Mic + Upload) + Model Picker
 import os
+import tempfile
+
+import streamlit as st
 from PIL import Image
 import pdfplumber
 import google.generativeai as genai
+from st_audiorec import st_audiorec  # pip install streamlit-audiorec
 
 st.set_page_config(page_title="AidLens", page_icon="🧠", layout="centered")
 st.title("🧠 AidLens — Social Good Assistant")
@@ -35,7 +38,7 @@ if st.sidebar.button("🔎 Show available models"):
             for m in genai.list_models():
                 methods = getattr(m, "supported_generation_methods", [])
                 if "generateContent" in methods:
-                    models.append(m.name)
+                    models.append(m.name)  # e.g. "models/...."
             if not models:
                 st.sidebar.warning("No generateContent models found for this key.")
             else:
@@ -45,11 +48,16 @@ if st.sidebar.button("🔎 Show available models"):
             st.sidebar.error(f"Model list error: {e}")
 
 # ---------------- Helpers ----------------
-def extract_pdf_text(uploaded_pdf, max_pages=8, max_chars=12000):
+def normalize_model_name(m: str) -> str:
+    m = (m or "").strip()
+    if m and not m.startswith("models/"):
+        return "models/" + m
+    return m
+
+def extract_pdf_text(uploaded_pdf, max_pages=8, max_chars=12000) -> str:
     extracted = []
     with pdfplumber.open(uploaded_pdf) as pdf:
-        pages = pdf.pages[:max_pages]
-        for p in pages:
+        for p in pdf.pages[:max_pages]:
             t = p.extract_text() or ""
             if t.strip():
                 extracted.append(t.strip())
@@ -58,14 +66,13 @@ def extract_pdf_text(uploaded_pdf, max_pages=8, max_chars=12000):
         joined = joined[:max_chars] + "\n\n[Truncated]"
     return joined
 
-def build_prompt(role, language, content):
+def build_prompt(role: str, language: str, content: str):
     system = (
         "You are AidLens, an assistant for NGOs & volunteers. "
         "Explain clearly, avoid jargon, be safe and non-medical. "
         "If content is medical/legal, include a short disclaimer and suggest consulting a professional. "
         "Ask 1 follow-up question only if necessary."
     )
-
     user = f"""
 Role: {role}
 Language: {language}
@@ -80,29 +87,24 @@ Output format:
 4) Risks / what NOT to do (bullets)
 5) One clarifying question (only if necessary)
 """.strip()
-
     return system, user
 
-def normalize_model_name(m):
-    if m and not m.startswith("models/"):
-        return "models/" + m
-    return m
-
-def run_gemini_text(api_key, model_name, system, user, image=None):
+def run_gemini_text(api_key: str, model_name: str, system: str, user: str, image=None) -> str:
     genai.configure(api_key=api_key)
     model_name = normalize_model_name(model_name)
     model = genai.GenerativeModel(model_name, system_instruction=system)
 
-    if image:
+    if image is not None:
         resp = model.generate_content([user, image])
     else:
         resp = model.generate_content(user)
-    return resp.text
 
-def transcribe_audio_with_gemini(api_key, model_name, audio_bytes, mime_type):
+    return getattr(resp, "text", "") or ""
+
+def transcribe_audio_with_gemini(api_key: str, model_name: str, audio_bytes: bytes, mime_type: str, suffix: str) -> str:
     """
-    Uses Gemini to transcribe audio into text.
-    Works as a lightweight voice feature for hackathon demos.
+    Robust approach: write audio to a temp file, upload it, and ask Gemini to transcribe.
+    Works well on Streamlit Cloud.
     """
     genai.configure(api_key=api_key)
     model_name = normalize_model_name(model_name)
@@ -113,19 +115,22 @@ def transcribe_audio_with_gemini(api_key, model_name, audio_bytes, mime_type):
         "If Hindi/Hinglish, keep it as spoken. No extra commentary."
     )
 
-    # Gemini accepts multimodal content arrays; audio is passed as inline_data.
-    audio_part = {
-        "inline_data": {
-            "mime_type": mime_type,
-            "data": audio_bytes
-        }
-    }
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
 
-    resp = model.generate_content([prompt, audio_part])
-    return resp.text.strip()
+    try:
+        uploaded = genai.upload_file(tmp_path, mime_type=mime_type)
+        resp = model.generate_content([prompt, uploaded])
+        return (getattr(resp, "text", "") or "").strip()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 # ---------------- Main UI ----------------
-st.write("Paste text, upload an image or PDF, or add voice (audio). Then click **Analyze**.")
+st.write("Paste text, upload an image or PDF, or use **voice** (mic/upload). Then click **Analyze**.")
 
 text = st.text_area(
     "Text input (optional)",
@@ -137,6 +142,7 @@ tab1, tab2, tab3 = st.tabs(["🖼️ Image", "📄 PDF", "🎤 Voice"])
 
 image = None
 pdf_file = None
+wav_audio_data = None
 audio_file = None
 
 with tab1:
@@ -149,8 +155,12 @@ with tab2:
     pdf_file = st.file_uploader("Upload PDF (optional)", type=["pdf"])
 
 with tab3:
-    st.caption("Upload an audio file (m4a/mp3/wav). We'll transcribe it using Gemini, then analyze it.")
-    audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "ogg"])
+    st.caption("Use your microphone (record) OR upload an audio file.")
+    st.markdown("**🎙️ Speak now (click to record):**")
+    wav_audio_data = st_audiorec()  # returns wav bytes or None
+
+    st.markdown("**OR upload audio file:**")
+    audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "ogg"], label_visibility="collapsed")
 
 btn = st.button("Analyze", type="primary", use_container_width=True)
 
@@ -159,11 +169,11 @@ if btn:
         st.error("Please enter your Gemini API key in the sidebar.")
         st.stop()
 
-    if not model_name:
+    if not model_name.strip():
         st.error("Please enter a valid model name (click 'Show available models').")
         st.stop()
 
-    # 1) PDF -> text
+    # PDF -> text
     pdf_text = ""
     if pdf_file:
         try:
@@ -173,45 +183,68 @@ if btn:
             st.error(f"PDF read error: {e}")
             st.stop()
 
-    # 2) Voice -> text
+    # Voice -> text (Mic has priority, else uploaded file)
     voice_text = ""
-    if audio_file:
-        try:
-            with st.spinner("Transcribing audio..."):
-                audio_bytes = audio_file.read()
-                # Streamlit provides file type; fallback to wav
+    try:
+        if wav_audio_data is not None and len(wav_audio_data) > 0:
+            with st.spinner("Transcribing microphone audio..."):
+                voice_text = transcribe_audio_with_gemini(
+                    api_key=api_key,
+                    model_name=model_name,
+                    audio_bytes=wav_audio_data,
+                    mime_type="audio/wav",
+                    suffix=".wav"
+                )
+        elif audio_file is not None:
+            with st.spinner("Transcribing uploaded audio..."):
+                b = audio_file.read()
                 mime = audio_file.type or "audio/wav"
-                voice_text = transcribe_audio_with_gemini(api_key, model_name, audio_bytes, mime)
-                st.subheader("Voice Transcription")
-                st.write(voice_text)
-        except Exception as e:
-            st.error(f"Audio transcription error: {e}")
-            st.stop()
-
-    # 3) Combine inputs
-    combined_text = (text or "").strip()
+                # guess suffix
+                name = (audio_file.name or "").lower()
+                suffix = ".wav"
+                if name.endswith(".mp3"):
+                    suffix = ".mp3"
+                elif name.endswith(".m4a"):
+                    suffix = ".m4a"
+                elif name.endswith(".ogg"):
+                    suffix = ".ogg"
+                voice_text = transcribe_audio_with_gemini(
+                    api_key=api_key,
+                    model_name=model_name,
+                    audio_bytes=b,
+                    mime_type=mime,
+                    suffix=suffix
+                )
+    except Exception as e:
+        st.error(f"Audio transcription error: {e}")
+        st.stop()
 
     if voice_text:
-        combined_text = (combined_text + "\n\n--- Voice Transcript ---\n" + voice_text).strip()
+        st.subheader("Voice Transcription")
+        st.write(voice_text)
 
+    # Combine inputs
+    combined_text = (text or "").strip()
+    if voice_text:
+        combined_text = (combined_text + "\n\n--- Voice Transcript ---\n" + voice_text).strip()
     if pdf_text:
         combined_text = (combined_text + "\n\n--- PDF Content ---\n" + pdf_text).strip()
 
-    if not combined_text and not image:
-        st.error("Provide text, image, PDF, or voice audio.")
+    if not combined_text and image is None:
+        st.error("Provide text, image, PDF, or voice.")
         st.stop()
 
     content_for_prompt = combined_text if combined_text else "No text provided. Use image only."
     system, user_prompt = build_prompt(role, language, content_for_prompt)
 
-    # 4) Gemini response
     with st.spinner("Thinking with Gemini..."):
         try:
             out = run_gemini_text(api_key, model_name, system, user_prompt, image=image)
             st.subheader("Result")
-            st.write(out)
+            st.write(out if out else "No text returned.")
         except Exception as e:
             st.error(f"Error: {e}")
             st.info("Tip: Click 'Show available models' and copy a model that supports generateContent.")
+
 
 
