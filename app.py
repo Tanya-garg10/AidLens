@@ -19,7 +19,6 @@ api_key = st.sidebar.text_input(
     value=os.getenv("GEMINI_API_KEY", "")
 )
 
-# Default is placeholder; you'll pick from "Show available models"
 model_name = st.sidebar.text_input(
     "Model name (use models/...)",
     value=os.getenv("GEMINI_MODEL", "models/gemini-1.5-pro")
@@ -36,7 +35,7 @@ if st.sidebar.button("🔎 Show available models"):
             for m in genai.list_models():
                 methods = getattr(m, "supported_generation_methods", [])
                 if "generateContent" in methods:
-                    models.append(m.name)  # e.g. "models/...."
+                    models.append(m.name)
             if not models:
                 st.sidebar.warning("No generateContent models found for this key.")
             else:
@@ -45,32 +44,8 @@ if st.sidebar.button("🔎 Show available models"):
         except Exception as e:
             st.sidebar.error(f"Model list error: {e}")
 
-# ---------------- Main UI ----------------
-st.write("Paste text, upload an image, or upload a PDF. Then click **Analyze**.")
-
-text = st.text_area(
-    "Text input (optional)",
-    height=160,
-    placeholder="Paste the message / document text here..."
-)
-
-col1, col2 = st.columns(2)
-with col1:
-    img_file = st.file_uploader("Upload image (optional)", type=["png", "jpg", "jpeg"])
-with col2:
-    pdf_file = st.file_uploader("Upload PDF (optional)", type=["pdf"])
-
-image = None
-if img_file:
-    image = Image.open(img_file)
-    st.image(image, caption="Uploaded image", use_container_width=True)
-
+# ---------------- Helpers ----------------
 def extract_pdf_text(uploaded_pdf, max_pages=8, max_chars=12000):
-    """
-    Extract text from PDF safely.
-    - max_pages limits processing time
-    - max_chars limits prompt size
-    """
     extracted = []
     with pdfplumber.open(uploaded_pdf) as pdf:
         pages = pdf.pages[:max_pages]
@@ -108,21 +83,74 @@ Output format:
 
     return system, user
 
-def run_gemini(api_key, model_name, system, user, image=None):
+def normalize_model_name(m):
+    if m and not m.startswith("models/"):
+        return "models/" + m
+    return m
+
+def run_gemini_text(api_key, model_name, system, user, image=None):
     genai.configure(api_key=api_key)
-
-    # Auto-fix model name if user didn't include "models/"
-    if model_name and not model_name.startswith("models/"):
-        model_name = "models/" + model_name
-
+    model_name = normalize_model_name(model_name)
     model = genai.GenerativeModel(model_name, system_instruction=system)
 
     if image:
         resp = model.generate_content([user, image])
     else:
         resp = model.generate_content(user)
-
     return resp.text
+
+def transcribe_audio_with_gemini(api_key, model_name, audio_bytes, mime_type):
+    """
+    Uses Gemini to transcribe audio into text.
+    Works as a lightweight voice feature for hackathon demos.
+    """
+    genai.configure(api_key=api_key)
+    model_name = normalize_model_name(model_name)
+    model = genai.GenerativeModel(model_name)
+
+    prompt = (
+        "Transcribe this audio accurately into plain text. "
+        "If Hindi/Hinglish, keep it as spoken. No extra commentary."
+    )
+
+    # Gemini accepts multimodal content arrays; audio is passed as inline_data.
+    audio_part = {
+        "inline_data": {
+            "mime_type": mime_type,
+            "data": audio_bytes
+        }
+    }
+
+    resp = model.generate_content([prompt, audio_part])
+    return resp.text.strip()
+
+# ---------------- Main UI ----------------
+st.write("Paste text, upload an image or PDF, or add voice (audio). Then click **Analyze**.")
+
+text = st.text_area(
+    "Text input (optional)",
+    height=150,
+    placeholder="Paste the message / document text here..."
+)
+
+tab1, tab2, tab3 = st.tabs(["🖼️ Image", "📄 PDF", "🎤 Voice"])
+
+image = None
+pdf_file = None
+audio_file = None
+
+with tab1:
+    img_file = st.file_uploader("Upload image (optional)", type=["png", "jpg", "jpeg"])
+    if img_file:
+        image = Image.open(img_file)
+        st.image(image, caption="Uploaded image", use_container_width=True)
+
+with tab2:
+    pdf_file = st.file_uploader("Upload PDF (optional)", type=["pdf"])
+
+with tab3:
+    st.caption("Upload an audio file (m4a/mp3/wav). We'll transcribe it using Gemini, then analyze it.")
+    audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "ogg"])
 
 btn = st.button("Analyze", type="primary", use_container_width=True)
 
@@ -135,6 +163,7 @@ if btn:
         st.error("Please enter a valid model name (click 'Show available models').")
         st.stop()
 
+    # 1) PDF -> text
     pdf_text = ""
     if pdf_file:
         try:
@@ -144,22 +173,45 @@ if btn:
             st.error(f"PDF read error: {e}")
             st.stop()
 
+    # 2) Voice -> text
+    voice_text = ""
+    if audio_file:
+        try:
+            with st.spinner("Transcribing audio..."):
+                audio_bytes = audio_file.read()
+                # Streamlit provides file type; fallback to wav
+                mime = audio_file.type or "audio/wav"
+                voice_text = transcribe_audio_with_gemini(api_key, model_name, audio_bytes, mime)
+                st.subheader("Voice Transcription")
+                st.write(voice_text)
+        except Exception as e:
+            st.error(f"Audio transcription error: {e}")
+            st.stop()
+
+    # 3) Combine inputs
     combined_text = (text or "").strip()
+
+    if voice_text:
+        combined_text = (combined_text + "\n\n--- Voice Transcript ---\n" + voice_text).strip()
+
     if pdf_text:
         combined_text = (combined_text + "\n\n--- PDF Content ---\n" + pdf_text).strip()
 
     if not combined_text and not image:
-        st.error("Provide text, an image, or a PDF.")
+        st.error("Provide text, image, PDF, or voice audio.")
         st.stop()
 
     content_for_prompt = combined_text if combined_text else "No text provided. Use image only."
     system, user_prompt = build_prompt(role, language, content_for_prompt)
 
+    # 4) Gemini response
     with st.spinner("Thinking with Gemini..."):
         try:
-            out = run_gemini(api_key, model_name, system, user_prompt, image=image)
+            out = run_gemini_text(api_key, model_name, system, user_prompt, image=image)
             st.subheader("Result")
             st.write(out)
         except Exception as e:
             st.error(f"Error: {e}")
             st.info("Tip: Click 'Show available models' and copy a model that supports generateContent.")
+
+
